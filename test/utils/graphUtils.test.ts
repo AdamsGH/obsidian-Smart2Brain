@@ -3,6 +3,7 @@ import {
 	densityForceProfile,
 	densitySpreadFactor,
 	edgeAlphaZoomLift,
+	computeNodeDegrees,
 	edgeKey,
 	graphTopologySignature,
 	nodeDrawRadius,
@@ -17,6 +18,21 @@ describe("edgeKey / splitEdgeKey", () => {
 	});
 });
 
+describe("computeNodeDegrees", () => {
+	it("counts a tag edge for its tag only", () => {
+		const degrees = computeNodeDegrees([
+			{ source: "a.md", target: "b.md", type: "wiki" },
+			{ source: "a.md", target: "c.md", type: "semantic" },
+			{ source: "a.md", target: "tag:#x", type: "tag" },
+			{ source: "b.md", target: "tag:#x", type: "tag" },
+		]);
+		expect(degrees.get("a.md")).toBe(2);
+		expect(degrees.get("b.md")).toBe(1);
+		expect(degrees.get("c.md")).toBe(1);
+		expect(degrees.get("tag:#x")).toBe(2);
+	});
+});
+
 describe("graphTopologySignature", () => {
 	const node = (id: string) => ({ id });
 	const wiki = (source: string, target: string, weight = 1) => ({ source, target, type: "wiki", weight });
@@ -24,6 +40,17 @@ describe("graphTopologySignature", () => {
 	const base = () => ({
 		nodes: [node("a.md"), node("b.md"), node("c.md")],
 		edges: [wiki("a.md", "b.md"), wiki("b.md", "c.md", 2)],
+	});
+
+	it("ignores the tag layer, so showing tags invalidates nothing derived", () => {
+		const withTags = () => {
+			const graph = base();
+			return {
+				nodes: [...graph.nodes, { id: "tag:#foo", kind: "tag" }],
+				edges: [...graph.edges, { source: "a.md", target: "tag:#foo", type: "tag", weight: 1 }],
+			};
+		};
+		expect(graphTopologySignature(withTags())).toBe(graphTopologySignature(base()));
 	});
 
 	it("is stable for an identical graph", () => {
