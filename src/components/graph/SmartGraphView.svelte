@@ -84,6 +84,15 @@ import GraphControls from "./GraphControls.svelte";
 const plugin = getPlugin();
 const data = getData();
 
+/**
+ * Whether the semantic-edge scan has anything to run against: a graph index
+ * is selected *and* its config still exists. `loadSemanticEdges` silently
+ * returns nothing otherwise, so without this the "Inferred links" switch would
+ * be live but do nothing — the controls use it to disable that switch and say
+ * why.
+ */
+const hasGraphIndex = $derived(data.getGraphEmbedModel() != null);
+
 // Start restoring persisted topic caches immediately so the IndexedDB read
 // overlaps mounting; buildGraph awaits the same promise before reading them.
 void loadPersistedTopicCaches();
@@ -701,6 +710,15 @@ let buildGraphSignature = $derived(
 		// derived needs a rebuild (unlike `showSemanticLinks`, which only hides them).
 		semanticNeighborCount: settings.semanticNeighborCount,
 		semanticThreshold: settings.semanticThreshold,
+		// Which *usable* index (if any) the scan reads. `loadSemanticEdges` only
+		// sees it inside the untracked build, so without this key picking or
+		// clearing an index in settings left the old edges on screen — and still
+		// shaping the topics — until something else forced a rebuild. Keyed on
+		// availability rather than the raw id: a stale selection whose config
+		// was removed and then re-added keeps the same id, and that transition
+		// must rebuild too. The edge cache is keyed on the id, so switching back
+		// is served from cache, not rescanned.
+		graphIndex: hasGraphIndex ? data.graphEmbedIndex : null,
 	}),
 );
 $effect(() => {
@@ -2681,6 +2699,7 @@ function handleHoverPreview(event: MouseEvent, path: string, targetEl: HTMLEleme
     {lassoMode}
     onLassoModeChange={handleLassoModeChange}
     {graphData}
+    {hasGraphIndex}
     nodeCount={displayGraphData.nodes.length}
     segments={labeledSegments}
     {isTopicsCollapsed}
