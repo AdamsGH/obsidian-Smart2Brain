@@ -30,6 +30,7 @@ import { chunkText } from "../utils/chunkText";
 import { getEmbeddableVaultFiles, isEmbeddableFile, readIndexableContent } from "../utils/fileFiltering";
 import { Logger } from "../utils/logging";
 import { matchesPathPrefix } from "../utils/pathUtils";
+import { isConnectionRefusedError, isProviderUnreachableError } from "../lib/transportErrors";
 import {
 	configureEmbedIndexAction,
 	settingsAction,
@@ -363,9 +364,26 @@ export function orderChunksForWriting<T>(chunks: readonly T[]): T[] {
 	return [...chunks.slice(1), chunks[0]];
 }
 
+/**
+ * The mtime to store with a note's vectors: read *before* the content is.
+ *
+ * Obsidian updates `TFile.stat` in place, so reading it when the row is
+ * written — after the embedding round trip, the batch fill and the pacing
+ * pause — stamps a note edited in that window with its *new* mtime over its
+ * *old* content. Validation then compares equal mtimes and never repairs it.
+ * Reading the stamp first fails the other way: an edit that lands during the
+ * read leaves a stored mtime older than the file's, and the next validation
+ * re-indexes the note. That is the direction we can recover from.
+ */
+export function stampForRead(file: Pick<TFile, "stat">): number {
+	return file.stat.mtime;
+}
+
 /** One chunk of a note queued for embedding. */
 interface ChunkEntry {
 	file: TFile;
+	/** The note's mtime as of the read that produced `embedText` — see `stampForRead`. */
+	mtime: number;
 	chunkIndex: number;
 	checksum: string;
 	embedText: string;
@@ -914,6 +932,9 @@ export class VectorStoreService {
 
 		const filesToIndex = [...missingFiles, ...staleFiles];
 		let cancelled = false;
+		// Until the run below has returned, an error thrown out of it counts as
+		// an incomplete run for `settleValidationAfterBulkRun`.
+		let completed = false;
 		if (filesToIndex.length > 0) {
 			const { startingIndexedCount, totalCount } = summarizeValidationProgressCounts({
 				eligibleFileCount: vaultFiles.length,
@@ -943,6 +964,7 @@ export class VectorStoreService {
 					purgeExisting: true,
 					notice,
 				});
+				completed = !outcome.cancelled;
 			} catch (error) {
 				// An unexpected abort (not a per-file failure) — don't leave a stuck
 				// notice behind on top of whatever surfaced the error.
@@ -951,6 +973,7 @@ export class VectorStoreService {
 			} finally {
 				inst.abortController = null;
 				this.updateInstanceProgress(inst, { isIndexing: false, currentFile: null });
+				this.settleValidationAfterBulkRun(inst, completed);
 			}
 			cancelled = outcome.cancelled;
 
@@ -1040,16 +1063,43 @@ export class VectorStoreService {
 	}
 
 	/**
+	 * Whether a bulk run — a full build or a startup validation — is writing to
+	 * the instance right now. The two set different flags: `isIndexing` is the
+	 * build's, `progress.isIndexing` is shared with validation.
+	 */
+	private isBulkRunning(inst: IndexInstance): boolean {
+		return inst.isIndexing || inst.progress.isIndexing;
+	}
+
+	/**
+	 * Whether a vault event can be applied to `inst` right now; when it cannot,
+	 * flag the instance so a validation picks the change up later.
+	 *
+	 * An inactive instance is never written incrementally. An instance with a
+	 * bulk run in flight is not either: the run is writing the same notes, and
+	 * a note it has already passed would keep the pre-edit vectors while a note
+	 * it has not reached yet would be embedded twice, with the purge of the
+	 * second write able to land between the first write's chunks. Both used to
+	 * be silent `continue`s; for a running build that dropped the edit for the
+	 * whole session, since nothing re-validated after the build. Now the flag
+	 * is cleared, and the run reschedules a validation on completion — that
+	 * compares per-note mtimes, so it repairs exactly the notes that changed.
+	 */
+	private canApplyEvent(inst: IndexInstance): boolean {
+		if (!this.isActiveIndex(inst.indexId) || this.isBulkRunning(inst) || !inst.embeddings) {
+			inst.hasValidatedThisSession = false;
+			return false;
+		}
+		return true;
+	}
+
+	/**
 	 * Handle new file creation — forward to active instances only.
 	 * Inactive instances are marked for re-validation on next use.
 	 */
 	private async handleFileCreate(file: TFile): Promise<void> {
 		for (const inst of this.instances.values()) {
-			if (!this.isActiveIndex(inst.indexId)) {
-				inst.hasValidatedThisSession = false;
-				continue;
-			}
-			if (!inst.embeddings || inst.isIndexing) continue;
+			if (!this.canApplyEvent(inst)) continue;
 			await this.indexDocumentForInstance(inst, file);
 			void this.notifyStatsChanged(inst);
 		}
@@ -1075,11 +1125,7 @@ export class VectorStoreService {
 	/** Re-embed a modified note in every active instance whose stored copy is older. */
 	private async reindexModifiedFile(file: TFile): Promise<void> {
 		for (const inst of this.instances.values()) {
-			if (!this.isActiveIndex(inst.indexId)) {
-				inst.hasValidatedThisSession = false;
-				continue;
-			}
-			if (!inst.embeddings || inst.isIndexing) continue;
+			if (!this.canApplyEvent(inst)) continue;
 			const storedMtime = await inst.store.getDocumentMtime(file.path);
 			if (storedMtime && storedMtime >= file.stat.mtime) continue;
 			await this.indexDocumentForInstance(inst, file);
@@ -1097,6 +1143,10 @@ export class VectorStoreService {
 				inst.hasValidatedThisSession = false;
 				continue;
 			}
+			// Removal is safe alongside a bulk run, but the run may have read the
+			// note before it went and write it back afterwards; the validation the
+			// run schedules on completion removes such an orphan.
+			if (this.isBulkRunning(inst)) inst.hasValidatedThisSession = false;
 			await inst.store.remove(file.path);
 			void this.notifyStatsChanged(inst);
 		}
@@ -1112,8 +1162,10 @@ export class VectorStoreService {
 				inst.hasValidatedThisSession = false;
 				continue;
 			}
+			// The old path's rows go regardless; the new path is written only when
+			// no bulk run is in flight (`canApplyEvent`), else left to validation.
 			await inst.store.remove(oldPath);
-			if (inst.embeddings) {
+			if (this.canApplyEvent(inst)) {
 				await this.indexDocumentForInstance(inst, file);
 			}
 			void this.notifyStatsChanged(inst);
@@ -1190,8 +1242,9 @@ export class VectorStoreService {
 
 		const count = await inst.store.count();
 		if (count === 0 || modelChanged || versionStale) {
+			// The build marks the instance validated itself (`runFullBuild`), and
+			// only for as long as no vault event is dropped while it runs.
 			await this.buildFullIndex(inst, embeddings, model);
-			inst.hasValidatedThisSession = true;
 		} else if (!inst.hasValidatedThisSession) {
 			// Not awaited: the search proceeds on the stored index while the catch-up
 			// runs after the platform's bulk start delay (immediate on desktop).
@@ -1270,21 +1323,9 @@ export class VectorStoreService {
 		return typeof name === "string" ? name : undefined;
 	}
 
-	private isProviderUnreachable(error: unknown): boolean {
-		// `AbortError` is deliberately NOT here: it means the *user* cancelled, which
-		// callers handle separately (and treating it as a provider fault would show a
-		// spurious "provider unreachable" notice on every cancel). `TimeoutError` is a
-		// provider fault and must survive `isUserCancellation` above it.
-		if (this.errorName(error) === "TimeoutError") return true;
-		const message = error instanceof Error ? error.message : String(error);
-		return /network error|you are offline|connection may have changed|fetch failed|failed to fetch|timed out|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|socket hang up|502|503|504/i.test(
-			message,
-		);
-	}
-
 	/**
-	 * Abort the run when the provider has failed repeatedly, rather than grinding
-	 * through every remaining chunk against a host that is plainly not answering.
+	 * Abort the run when the provider is not answering, rather than grinding
+	 * through every remaining chunk against a host that is plainly down.
 	 *
 	 * Without this, an unreachable endpoint produces one failed batch, then a
 	 * per-entry retry of every chunk in it, then the next batch, and so on —
@@ -1292,14 +1333,24 @@ export class VectorStoreService {
 	 * the progress notice sits frozen. Measured against a disconnected provider:
 	 * still "Embedding batch 1" and unchanged at 310/370 after 107 s.
 	 *
-	 * The threshold is >1 so a single blip (one flaky request, a transient 502
-	 * under load) still gets the existing per-entry retry path. Two consecutive
-	 * transport failures is no longer a blip.
+	 * Two kinds of failure, two thresholds. A refused connection or an
+	 * unresolvable host (`isConnectionRefusedError`) stops the run on the first
+	 * failure: nothing is listening, and a second batch against it only adds the
+	 * retry budget's wait to the notice's delay. Softer failures — a timeout, a
+	 * reset, a 502 under load — get one more chance: the *same* batch is retried
+	 * after a short pause (`UNREACHABLE_RETRY_PAUSE_MS`), so a single blip costs
+	 * nothing, and only a second consecutive failure stops the run. Marking the
+	 * blipped batch's notes as skipped instead — the previous rule — let a build
+	 * that then recovered report success with those notes missing.
 	 */
 	private readonly UNREACHABLE_FAILURE_LIMIT = 2;
 
+	/** Pause before the one retry of a batch that hit a soft transport failure. */
+	private readonly UNREACHABLE_RETRY_PAUSE_MS = 2_000;
+
 	private abortForUnreachableProvider(inst: IndexInstance, error: unknown, consecutiveFailures: number): boolean {
-		if (!this.isProviderUnreachable(error) || consecutiveFailures < this.UNREACHABLE_FAILURE_LIMIT) return false;
+		if (!isProviderUnreachableError(error)) return false;
+		if (!isConnectionRefusedError(error) && consecutiveFailures < this.UNREACHABLE_FAILURE_LIMIT) return false;
 
 		const reason = error instanceof Error ? error.message : String(error);
 		Logger.error(
@@ -1352,6 +1403,10 @@ export class VectorStoreService {
 	): Promise<void> {
 		inst.isIndexing = true;
 		inst.abortController = new AbortController();
+		// A full build covers every note as of now. A vault event that arrives
+		// while it runs cannot be applied (`canApplyEvent`) and clears this
+		// again, which is what makes the run schedule a catch-up on completion.
+		inst.hasValidatedThisSession = true;
 		const { vault } = this.plugin.app;
 		const allFiles = getEmbeddableVaultFiles(vault);
 
@@ -1381,16 +1436,17 @@ export class VectorStoreService {
 		const notice = new Notice("", 0);
 		this.updateNotice(notice, inst.progress);
 
+		let cancelled = true;
 		try {
 			await inst.store.setMetadata(model.provider, model.model, INDEX_VERSION);
 
-			const { cancelled } = await this.embedFilesInBatches(inst, embeddings, model, files, {
+			({ cancelled } = await this.embedFilesInBatches(inst, embeddings, model, files, {
 				startingIndexedCount: 0,
 				preFilterSkipped: skippedFiles.length,
 				purgeExisting: false,
 				notice,
 				report,
-			});
+			}));
 
 			// Save the indexing report
 			inst.report = { ...report, timestamp: Date.now() };
@@ -1418,7 +1474,36 @@ export class VectorStoreService {
 			inst.isIndexing = false;
 			inst.abortController = null;
 			this.updateInstanceProgress(inst, { isIndexing: false, currentFile: null });
+			this.settleValidationAfterBulkRun(inst, !cancelled);
 		}
+	}
+
+	/**
+	 * Settle the instance's validation state after a bulk run.
+	 *
+	 * A run that did not complete — cancelled by the user, stopped for an
+	 * unreachable provider, or thrown out of — leaves a partial index, and a
+	 * partial index is not validated: the flag is cleared so the next
+	 * `ensureIndex` (a search, or the settings row's re-index) schedules the
+	 * validation that finishes it. That is the "resume" the unreachable-provider
+	 * notice promises; before, a retry in the same session saw a non-empty,
+	 * validated store and did nothing until Obsidian restarted. No catch-up is
+	 * scheduled here for such a run, though: the user asked for the writes to
+	 * stop, and one would resume them on its own.
+	 *
+	 * A completed run whose flag was cleared under it (a vault event arrived
+	 * while it wrote, see `canApplyEvent`) schedules the catch-up that applies
+	 * those changes.
+	 */
+	private settleValidationAfterBulkRun(inst: IndexInstance, completed: boolean): void {
+		if (!completed) {
+			inst.hasValidatedThisSession = false;
+			return;
+		}
+		if (inst.hasValidatedThisSession) return;
+		if (this.instances.get(inst.indexId) !== inst) return;
+		Logger.log(`[VectorStore] Vault changed during the bulk run for ${inst.indexId}; scheduling a catch-up`);
+		this.scheduleValidation(inst);
 	}
 
 	/**
@@ -1500,7 +1585,7 @@ export class VectorStoreService {
 			const doc: DocumentVector = {
 				id: makeChunkId(entry.file.path, entry.chunkIndex),
 				path: entry.file.path,
-				mtime: entry.file.stat.mtime,
+				mtime: entry.mtime,
 				checksum: entry.checksum,
 				chunkIndex: entry.chunkIndex,
 				vector: new Float32Array(vector),
@@ -1571,15 +1656,18 @@ export class VectorStoreService {
 				Logger.warn(`[VectorStore] Batch ${batchNumber} failed, falling back to sequential:`, error);
 				// A transport failure will hit every remaining chunk the same way,
 				// so retrying this batch entry-by-entry is pure waste. Give the
-				// connection one more chance, then stop the whole run.
-				if (this.isProviderUnreachable(error)) {
+				// connection one more chance with the same batch, then stop the
+				// whole run; a batch is never written off as skipped for a
+				// transport failure, so a blip cannot drop notes from a build that
+				// goes on to report success.
+				if (isProviderUnreachableError(error)) {
 					consecutiveUnreachable++;
 					if (this.abortForUnreachableProvider(inst, error, consecutiveUnreachable)) return false;
-					// Account for the batch before skipping the per-entry retry, so
-					// the notes are reported as skipped rather than silently dropped
-					// from a run that still claims success.
-					for (const entry of batch) noteFailed(entry.file.path, "embed-error");
-					return true;
+					Logger.warn(`[VectorStore] Retrying batch ${batchNumber} once after a transport failure`);
+					await bulkPause(this.UNREACHABLE_RETRY_PAUSE_MS);
+					if (aborted()) return false;
+					batchNumber--;
+					return embedBatch(queued);
 				}
 				consecutiveUnreachable = 0;
 
@@ -1642,12 +1730,14 @@ export class VectorStoreService {
 				break;
 			}
 			try {
+				const mtime = stampForRead(file);
 				const content = await readIndexableContent(vault, file);
 				const checksum = this.hashContent(content);
 				const chunks = chunkText(content, file.basename, maxContentLength);
 				for (const chunk of orderChunksForWriting(chunks)) {
 					pending.push({
 						file,
+						mtime,
 						chunkIndex: chunk.chunkIndex,
 						checksum,
 						embedText: chunk.content,
@@ -1663,6 +1753,10 @@ export class VectorStoreService {
 			}
 
 			while (pending.length >= batchSize) {
+				if (aborted()) {
+					stopped = true;
+					break;
+				}
 				const batch = pending.splice(0, batchSize);
 				if (!(await embedBatch(batch))) {
 					stopped = true;
@@ -1772,6 +1866,7 @@ export class VectorStoreService {
 		}
 
 		try {
+			const mtime = stampForRead(file);
 			const content = await readIndexableContent(this.plugin.app.vault, file);
 			const maxContentLength = await this.getMaxEmbeddingContentLength(inst, model);
 			const checksum = this.hashContent(content);
@@ -1797,7 +1892,7 @@ export class VectorStoreService {
 				const doc: DocumentVector = {
 					id: makeChunkId(file.path, chunks[i].chunkIndex),
 					path: file.path,
-					mtime: file.stat.mtime,
+					mtime,
 					checksum,
 					chunkIndex: chunks[i].chunkIndex,
 					vector: vectors[i],
@@ -1877,7 +1972,7 @@ export class VectorStoreService {
 			const rejectedByFilter = new Set<string>();
 
 			for (const r of results) {
-				const path = r.doc.path;
+				const path = r.path;
 				if (rejectedByFilter.has(path)) continue;
 
 				if (!passedFilter.has(path)) {
@@ -1969,7 +2064,7 @@ export class VectorStoreService {
 		this.lastSearchFailureNoticeAt = now;
 
 		const reason = error instanceof Error ? error.message : String(error);
-		const offline = /network|offline|fetch failed|timed out|ECONNREFUSED|ENOTFOUND/i.test(reason);
+		const offline = isProviderUnreachableError(error);
 		showActionNotice(
 			offline
 				? "Semantic search unavailable — the embedding provider is not reachable. Showing no semantic results."
