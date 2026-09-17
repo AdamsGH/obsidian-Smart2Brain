@@ -1,8 +1,9 @@
-import { FileView, Notice, setIcon, type TFile, type WorkspaceLeaf } from "obsidian";
+import { FileView, type Menu, Notice, setIcon, type TFile, type WorkspaceLeaf } from "obsidian";
 import type SecondBrainPlugin from "../../main";
 import { DEFAULT_WIDGET_ICON, resolveWidgetIcon } from "../../widget/widgetIcon";
 import { WidgetRenderChild } from "../../widget/WidgetRenderChild";
 import { parseWidgetSpec } from "../../widget/widgetSpec";
+import { RenameWidgetModal } from "./RenameWidgetModal";
 
 export const VIEW_TYPE_WIDGET = "smart-second-brain-widget";
 /** Extension of a standalone widget file. Its content is a widget fence's body: optional frontmatter, then HTML. */
@@ -16,7 +17,9 @@ const RERENDER_DEBOUNCE_MS = 500;
  * is how an agent edit accepted through the review flow lands here) and follows renames
  * and deletes the way any `FileView` does. Obsidian has no text editor for the
  * extension, so the leaf carries a minimal source mode of its own (a textarea with
- * save/cancel) behind a header action, next to a refresh action.
+ * save/cancel). It and Rename live in the tab's context menu, where Obsidian keeps
+ * file actions (there is no native rename for a non-markdown tab); the header stays
+ * as bare as a PDF or image tab, since editing a widget's source is a rare thing to do.
  */
 export class WidgetView extends FileView {
 	navigation = true;
@@ -54,15 +57,31 @@ export class WidgetView extends FileView {
 		this.contentEl.addClass("s2b-widget-view");
 		this.body = this.contentEl.createDiv({ cls: "s2b-widget-view-body" });
 
-		this.addAction("pencil", "Edit source", () => void this.toggleSource());
-		this.addAction("refresh-cw", "Refresh", () => void this.render());
-
 		this.registerEvent(
 			this.plugin.app.vault.on("modify", (file) => {
 				if (file.path !== this.file?.path) return;
 				if (this.source) this.markSourceStale();
 				else this.scheduleRender();
 			}),
+		);
+	}
+
+	onPaneMenu(menu: Menu, source: string): void {
+		super.onPaneMenu(menu, source);
+		if (!this.file) return;
+		menu.addItem((item) =>
+			item
+				.setSection("action")
+				.setTitle(this.source ? "Show widget" : "Edit source")
+				.setIcon(this.source ? "layout-template" : "code")
+				.onClick(() => void this.toggleSource()),
+		);
+		menu.addItem((item) =>
+			item
+				.setSection("action")
+				.setTitle("Rename...")
+				.setIcon("pencil")
+				.onClick(() => this.promptRename()),
 		);
 	}
 
@@ -190,6 +209,10 @@ export class WidgetView extends FileView {
 		}
 		this.closeSource();
 		await this.render();
+	}
+
+	private promptRename(): void {
+		if (this.file) new RenameWidgetModal(this.plugin.app, this.file).open();
 	}
 
 	private closeSource(): void {
