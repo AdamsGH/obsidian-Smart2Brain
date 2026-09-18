@@ -34,6 +34,21 @@ describe("buildToolOutputRenderModel", () => {
 		expect(output.text).toBe(original);
 	});
 
+	it.each(['Content of "Note.md"', 'Content of PDF "Note.pdf"', 'Content of Excalidraw drawing "Note.excalidraw"'])(
+		"does not treat literal UI markers as truncation: %s",
+		(header) => {
+			const content = "Example notice:\n\n[UI preview truncated: 123 characters omitted]";
+			const model = buildToolOutputRenderModel("read_content", `${header}:\n\n${content}`);
+			expect(model).toMatchObject({ kind: "read_content", payload: { content, truncated: false } });
+
+			const toolTruncated = buildToolOutputRenderModel(
+				"read_content",
+				`${header}:\n\n[Content truncated at 100 characters]`,
+			);
+			expect(toolTruncated).toMatchObject({ kind: "read_content", payload: { truncated: true } });
+		},
+	);
+
 	it("renders search_notes payloads as a specialized model", () => {
 		const model = buildToolOutputRenderModel(
 			"search_notes",

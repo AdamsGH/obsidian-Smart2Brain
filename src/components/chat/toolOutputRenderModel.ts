@@ -206,6 +206,9 @@ function buildStringOutputRenderModel(
 	}
 
 	const specialized = buildSpecializedStringModel(toolName, trimmed, input);
+	if (specialized?.kind === "read_content" && output.length > MAX_RENDERED_TOOL_OUTPUT_CHARS) {
+		specialized.payload.truncated = true;
+	}
 	if (specialized) return specialized;
 
 	if (looksLikeMarkdown(trimmed)) {
@@ -451,7 +454,7 @@ function parseReadContentPayload(value: string): ReadContentPayload | undefined 
 			label: pdfMatch[2],
 			content: pdfMatch[3],
 			analysisLabel,
-			truncated: isContentTruncated(pdfMatch[3]),
+			truncated: pdfMatch[3].includes("[Content truncated at"),
 		};
 	}
 
@@ -463,7 +466,7 @@ function parseReadContentPayload(value: string): ReadContentPayload | undefined 
 			label: excalidrawMatch[2],
 			content: excalidrawMatch[3],
 			analysisLabel,
-			truncated: isContentTruncated(excalidrawMatch[3]),
+			truncated: excalidrawMatch[3].includes("[Content truncated at"),
 		};
 	}
 
@@ -475,15 +478,11 @@ function parseReadContentPayload(value: string): ReadContentPayload | undefined 
 			label: fileMatch[2],
 			content: fileMatch[3],
 			analysisLabel,
-			truncated: isContentTruncated(fileMatch[3]),
+			truncated: fileMatch[3].includes("[Content truncated at"),
 		};
 	}
 
 	return undefined;
-}
-
-function isContentTruncated(content: string): boolean {
-	return content.includes("[Content truncated at") || content.includes(UI_TRUNCATION_MARKER);
 }
 
 function buildExecuteJavaScriptPayload(
